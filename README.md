@@ -1,4 +1,4 @@
-Old code:
+Other code:
 
 [EspHome MQTT Shelly EM subscription](https://gist.github.com/jonasman/912ba0c249ba03fce19fe4f6618a022b)
 
