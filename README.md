@@ -1,4 +1,5 @@
 Scripts for ESPHome to control the TeslaWallConnector V3 via the modbus connector.
+
 Im using this device to connect to the RS485 Modbus in the WC3: https://www.waveshare.com/esp32-s3-rs485-can.htm
 
 
