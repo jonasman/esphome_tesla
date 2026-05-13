@@ -1,0 +1,395 @@
+substitutions:
+  #device: https://www.waveshare.com/esp32-s3-rs485-can.htm
+  device_name: esp-tesla
+  friendly_name: ESPHome Tesla
+  tx_pin: GPIO17 # RS485 TX (DI)
+  rx_pin: GPIO18 # RS485 RX (RO)
+  # Some docs mention GPIO1 for direction control (DE/RE), but the board usually has auto-flow control.
+  # If it doesn't work, try uncommenting the line below in the uart section.
+  flow_control_pin: 21
+  ct1_value_id: internal_meter_reading # Name of the (number) variable that needs to be set as ct reading
+  min_value: 0.0
+  max_value: 45.0 # adjust to a value above configured max-value in Wall Connector config
+  start_value: 0.0 # Initial value at boot - determines the behavior when home assistant
+                   # is not dynamically changing the ct amps: set it at zero and the maximum charging amps
+                   # will be available to the car. Set it to max_value and the charger will only offer the car 6A
+  # serial <-> modbus bridge config
+  baud_rate: 115200
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  board_chip: "ESP32-S3"
+  board_name: "WS RS485-CAN"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+  # Waveshare ESP32-S3-RS485-CAN typically has 16MB Flash and 8MB PSRAM
+  # detailed config to ensure full memory access:
+  variant: esp32s3
+  flash_size: 16MB
+
+logger:
+  level: INFO
+  # For native USB on ESP32-S3 (no CP210x/CH340 chip):
+  hardware_uart: USB_CDC
+  logs:
+    # RS485/Modbus debugging - the ones we care about:
+    uart: INFO
+    modbus: INFO
+    modbus_controller: INFO
+    # Quiet down noisy components to keep logs readable:
+    wifi: INFO
+    api: INFO
+    ota: INFO
+    http_request: INFO
+    sensor: INFO
+    switch: INFO
+    number: INFO
+    # Set global level back to DEBUG once RS485 is working
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: 2025.12.0
+  name_add_mac_suffix: false
+
+wifi:
+  networks:
+  - ssid: !secret wifi_ssid
+    password: !secret wifi_password
+  min_auth_mode: WPA2
+
+ota:
+  - platform: esphome
+    id: esphome_ota
+
+web_server:
+  port: 80
+  version: 3
+
+api:
+
+mqtt:
+  broker: 10.0.1.100
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  id: mqtt_client
+  discovery: false     # Don't publish HA discovery messages
+  on_message:
+    - topic: "shellypro3em-c8f09e8732c8/status/em1:2"
+      then:
+        - lambda: |-
+            if (!id(enable_shelly)) return;
+
+            json::parse_json(x, [](JsonObject root) -> bool {
+              if (!root["current"].is<double>()) {
+                ESP_LOGW("shelly-mqtt", "No 'current' key in MQTT payload");
+                return false;
+              }
+
+              float current = root["current"];
+
+              // Set power BEFORE publishing current (avoids race condition)
+              if (root["act_power"].is<double>()) {
+                float power = root["act_power"];
+                id(ct1_power_w) = power;
+                id(ct_total_w) = power;
+              }
+
+              // Publish current LAST (triggers on_value on internal_meter_reading)
+              id(${ct1_value_id}).publish_state(round(current * 10) / 10);
+
+              return true;
+            });
+globals:
+  - id: enable_shelly
+    type: bool
+    initial_value: "true"
+    restore_value: true
+
+
+  - id: ct1_voltage_v
+    type: float
+    initial_value: "230"
+
+  - id: ct1_power_w
+    type: float
+    initial_value: "0.0"
+  - id: ct2_power_w
+    type: float
+    initial_value: "0.0"
+  - id: ct3_power_w
+    type: float
+    initial_value: "0.0"
+  - id: ct4_power_w
+    type: float
+    initial_value: "0.0"
+  - id: ct_total_w
+    type: float
+    initial_value: "0.0"
+
+  - id: ct1_current_a
+    type: float
+    initial_value: "0.0"
+  - id: ct2_current_a
+    type: float
+    initial_value: "0.0"
+  - id: ct3_current_a
+    type: float
+    initial_value: "0.0"
+  - id: ct4_current_a
+    type: float
+    initial_value: "0.0"
+  - id: ct_total_a
+    type: float
+    initial_value: "0.0"
+
+switch:
+  - platform: template
+    id: read_from_shelly
+    name: "Read from Shelly global"
+    restore_mode: RESTORE_DEFAULT_ON
+    lambda: |-
+      return id(enable_shelly);
+    turn_on_action:
+      globals.set:
+        id: enable_shelly
+        value: "true"
+    turn_off_action:
+      globals.set:
+        id: enable_shelly
+        value: "false"
+
+
+button:
+  - platform: restart
+    name: "${friendly_name} Restart"
+
+# Power config value
+number:
+  # The number to be changed externally, used if shelly mode is disabled
+  - platform: template
+    id: meter_reading
+    name: "Meter Reading"
+    icon: "mdi:meter-electric"
+    disabled_by_default: false
+    unit_of_measurement: "A"
+    min_value: ${min_value}
+    max_value: ${max_value}
+    step: 0.1
+    initial_value: ${start_value}  # cannot be used with lambda
+    optimistic: true # update when set
+    on_value:
+      then:
+        lambda: |-
+          // Copy this value to the internal number, used for modbus
+          id(internal_meter_reading).publish_state(id(meter_reading).state);
+
+  # The actual number used to calculate modbus data
+  - platform: template
+    id: internal_meter_reading
+    icon: "mdi:meter-electric"
+    disabled_by_default: false
+    unit_of_measurement: "A"
+    min_value: ${min_value}
+    max_value: ${max_value}
+    step: 0.1
+    initial_value: ${start_value}  # cannot be used with lambda
+    optimistic: true # update when set
+    on_value:
+      then:
+        lambda: |-
+          // Single-phase: only CT1 has real values
+          id(ct1_current_a) = id(${ct1_value_id}).state + id(reading_offset).state;
+          id(ct_total_a) = id(ct1_current_a);
+          
+          // Only calculate power if Shelly/MQTT mode is off (MQTT provides actual measured power)
+          if (!id(enable_shelly)) {
+            id(ct1_power_w) = id(ct1_voltage_v) * id(ct1_current_a); // assume cos phi = 1
+            id(ct_total_w) = id(ct1_power_w);
+          }
+          // When Shelly is enabled, power is set directly from act_power in MQTT callback
+
+  # Add an offset to the current set externally or read by Shelly. Useful to further reduce charging current.
+  - platform: template
+    id: reading_offset
+    name: "Meter reading offset"
+    unit_of_measurement: "A"
+    initial_value: 0
+    step: 0.1
+    min_value: 0
+    max_value: ${max_value}
+    optimistic: true
+    restore_value: true
+    on_value:
+      then:
+        lambda: |-
+          // Refresh the meter value if the offset changed
+          id(${ct1_value_id}).publish_state(id(${ct1_value_id}).state);
+
+sensor:
+  - platform: template
+    name: "CT Sensor 1 current"
+    unit_of_measurement: A
+    state_class: measurement
+    device_class: current
+    lambda: |-
+      return id(ct1_current_a);
+    update_interval: 5s
+    accuracy_decimals: 1
+    disabled_by_default: true
+
+  - platform: template
+    name: "CT Sensor 1 power"
+    unit_of_measurement: W
+    state_class: measurement
+    device_class: power
+    lambda: |-
+      return id(ct1_power_w);
+    update_interval: 5s
+    accuracy_decimals: 0
+    disabled_by_default: true
+
+uart:
+  - id: wallconn_uart
+    tx_pin: ${tx_pin}
+    rx_pin: ${rx_pin}
+    baud_rate: ${baud_rate}
+    data_bits: ${data_bits}
+    parity: ${parity}
+    stop_bits: ${stop_bits}
+    flow_control_pin: ${flow_control_pin}
+    debug:
+      direction: BOTH
+      dummy_receiver: false
+      after:
+        timeout: 50ms
+      sequence:
+        - lambda: |-
+            UARTDebug::log_hex(direction, bytes, ',');
+
+modbus:
+  - id: wallconn_modbus
+    uart_id: wallconn_uart
+    role: server
+
+modbus_controller:
+  - id: wc_mb_server # modbus server (wall conector is client/requestor)
+    modbus_id: wallconn_modbus
+    address: 1
+    server_registers:
+      # Serial number / MAC address
+      - { address: 1, value_type: U_WORD, read_lambda: 'return 0x3078;' }
+      - { address: 2, value_type: U_WORD, read_lambda: 'return 0x3030;' }
+      - { address: 3, value_type: U_WORD, read_lambda: 'return 0x3030;' }
+      - { address: 4, value_type: U_WORD, read_lambda: 'return 0x3034;' }
+      - { address: 5, value_type: U_WORD, read_lambda: 'return 0x3731;' }
+      - { address: 6, value_type: U_WORD, read_lambda: 'return 0x3442;' }
+      - { address: 7, value_type: U_WORD, read_lambda: 'return 0x3035;' }
+      - { address: 8, value_type: U_WORD, read_lambda: 'return 0x3638;' }
+      - { address: 9, value_type: U_WORD, read_lambda: 'return 0x3631;' }
+      - { address: 10, value_type: U_WORD, read_lambda: 'return 0x0000;' }
+
+      # "1.6.1‑Tesla"
+      - { address: 11, value_type: U_WORD, read_lambda: 'return 0x312E;' }
+      - { address: 12, value_type: U_WORD, read_lambda: 'return 0x362E;' }
+      - { address: 13, value_type: U_WORD, read_lambda: 'return 0x312D;' }
+      - { address: 14, value_type: U_WORD, read_lambda: 'return 0x5465;' }
+      - { address: 15, value_type: U_WORD, read_lambda: 'return 0x736C;' }
+      - { address: 16, value_type: U_WORD, read_lambda: 'return 0x6100;' }
+
+      # Four reserved words (all 0xFFFF)
+      - { address: 17, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 18, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 19, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 20, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+
+      # "012.00020A.H"
+      - { address: 21, value_type: U_WORD, read_lambda: 'return 0x3031;' }
+      - { address: 22, value_type: U_WORD, read_lambda: 'return 0x322E;' }
+      - { address: 23, value_type: U_WORD, read_lambda: 'return 0x3030;' }
+      - { address: 24, value_type: U_WORD, read_lambda: 'return 0x3032;' }
+      - { address: 25, value_type: U_WORD, read_lambda: 'return 0x3041;' }
+      - { address: 26, value_type: U_WORD, read_lambda: 'return 0x2E48;' }
+      - { address: 27, value_type: U_WORD, read_lambda: 'return 0x0000;' }
+
+      # Reserved
+      - { address: 28, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+
+      # Meter number "90954"
+      - { address: 29, value_type: U_WORD, read_lambda: 'return 0x3930;' }
+      - { address: 30, value_type: U_WORD, read_lambda: 'return 0x3935;' }
+      - { address: 31, value_type: U_WORD, read_lambda: 'return 0x3400;' }
+
+      # Model? "VAH4810AB0231"
+      - { address: 32, value_type: U_WORD, read_lambda: 'return 0x5641;' }
+      - { address: 33, value_type: U_WORD, read_lambda: 'return 0x4834;' }
+      - { address: 34, value_type: U_WORD, read_lambda: 'return 0x3831;' }
+      - { address: 35, value_type: U_WORD, read_lambda: 'return 0x3041;' }
+      - { address: 36, value_type: U_WORD, read_lambda: 'return 0x4230;' }
+      - { address: 37, value_type: U_WORD, read_lambda: 'return 0x3233;' }
+      - { address: 38, value_type: U_WORD, read_lambda: 'return 0x3100;' }
+
+      # eight more reserved (0xFFFF)
+      - { address: 39, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 40, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 41, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 42, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 43, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 44, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 45, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 46, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+
+      # Mac "04:71:4B:05:68:61"
+      - { address: 47, value_type: U_WORD, read_lambda: 'return 0x3034;' }
+      - { address: 48, value_type: U_WORD, read_lambda: 'return 0x3A37;' }
+      - { address: 49, value_type: U_WORD, read_lambda: 'return 0x313A;' }
+      - { address: 50, value_type: U_WORD, read_lambda: 'return 0x3442;' }
+      - { address: 51, value_type: U_WORD, read_lambda: 'return 0x3A30;' }
+      - { address: 52, value_type: U_WORD, read_lambda: 'return 0x353A;' }
+      - { address: 53, value_type: U_WORD, read_lambda: 'return 0x3638;' }
+      - { address: 54, value_type: U_WORD, read_lambda: 'return 0x3A36;' }
+      - { address: 55, value_type: U_WORD, read_lambda: 'return 0x3100;' }
+
+      # CT1 power W
+      - { address: 0x88, value_type: FP32, read_lambda: 'return id(ct1_power_w);' }
+
+      # CT2 power W
+      - { address: 0x8A, value_type: FP32, read_lambda: 'return id(ct2_power_w);' }
+
+      # CT3 power W
+      - { address: 0x8C, value_type: FP32, read_lambda: 'return id(ct3_power_w);' }
+
+      # CT4 power W
+      - { address: 0x8E, value_type: FP32, read_lambda: 'return id(ct4_power_w);' }
+
+      # Aggregate watts
+      - { address: 0x90, value_type: FP32, read_lambda: 'return id(ct_total_w);' }
+
+      # Reserved
+      - { address: 0x92, value_type: U_WORD, read_lambda: 'return 0;' }
+
+      # CT1 current amps
+      - { address: 0xF4, value_type: FP32, read_lambda: 'return id(ct1_current_a);' }
+
+      # CT2 current amps
+      - { address: 0xF6, value_type: FP32, read_lambda: 'return id(ct2_current_a);' }
+
+      # CT3 current amps
+      - { address: 0xF8, value_type: FP32, read_lambda: 'return id(ct3_current_a);' }
+
+      # CT4 current amps
+      - { address: 0xFA, value_type: FP32, read_lambda: 'return id(ct4_current_a);' }
+
+      # Total amps
+      - { address: 0xFC, value_type: FP32, read_lambda: 'return id(ct_total_a);' }
+
+      # Initialization handshake
+      - { address: 40002, value_type: U_WORD, read_lambda: 'return 0x0001;' }
+      - { address: 40003, value_type: U_WORD, read_lambda: 'return 0x0042;' }
+      - { address: 40004, value_type: U_WORD, read_lambda: 'return 0x4765;' }
+      - { address: 40005, value_type: U_WORD, read_lambda: 'return 0x6E65;' }
+      - { address: 40006, value_type: U_WORD, read_lambda: 'return 0x7261;' }
+      - { address: 40007, value_type: U_WORD, read_lambda: 'return 0x6300;' }
