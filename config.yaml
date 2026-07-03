@@ -20,6 +20,8 @@ substitutions:
   stop_bits: 1
   board_chip: "ESP32-S3"
   board_name: "WS RS485-CAN"
+  watchdog_failsafe_a: "21.0"
+  watchdog_timeout_ms: "10000"
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -98,17 +100,43 @@ mqtt:
                 id(ct_total_w) = power;
               }
 
+              // Mark fresh data arrival for the watchdog
+              id(last_shelly_rx_ms) = millis();
+
               // Publish current LAST (triggers on_value on internal_meter_reading)
               id(${ct1_value_id}).publish_state(round(current * 10) / 10);
 
               return true;
             });
+
+# Watchdog: if no MQTT message for 10s, drop the current to a failsafe value so the
+# Wall Connector backs off rather than charging based on stale data.
+interval:
+  - interval: 2s
+    then:
+      - lambda: |-
+          if (!id(enable_shelly)) return;
+          if (id(last_shelly_rx_ms) == 0) return;  // never received yet, leave alone
+          uint32_t age = millis() - id(last_shelly_rx_ms);
+          if (age > ${watchdog_timeout_ms}) {
+            float failsafe = ${watchdog_failsafe_a};
+            if (id(${ct1_value_id}).state != failsafe) {
+              ESP_LOGW("shelly-mqtt",
+                       "No MQTT message for %u ms, forcing reading to %.1fA (failsafe)",
+                       age, failsafe);
+              id(${ct1_value_id}).publish_state(failsafe);
+            }
+          }
+
 globals:
   - id: enable_shelly
     type: bool
     initial_value: "true"
     restore_value: true
 
+  - id: last_shelly_rx_ms
+    type: uint32_t
+    initial_value: "0"
 
   - id: ct1_voltage_v
     type: float
@@ -275,11 +303,11 @@ modbus:
     uart_id: wallconn_uart
     role: server
 
-modbus_controller:
+modbus_server:
   - id: wc_mb_server # modbus server (wall conector is client/requestor)
     modbus_id: wallconn_modbus
     address: 1
-    server_registers:
+    registers:
       # Serial number / MAC address
       - { address: 1, value_type: U_WORD, read_lambda: 'return 0x3078;' }
       - { address: 2, value_type: U_WORD, read_lambda: 'return 0x3030;' }
