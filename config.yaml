@@ -79,6 +79,8 @@ mqtt:
   password: !secret mqtt_password
   id: mqtt_client
   discovery: false     # Don't publish HA discovery messages
+  discover_ip: false   # Don't broadcast/respond on esphome/discover/... (not needed, we use WiFi/API for OTA)
+  log_topic: null       # Don't mirror logger output to MQTT (UART/modbus debug logs would flood the broker)
   on_message:
     - topic: "shellypro3em-c8f09e8732c8/status/em1:2"
       then:
