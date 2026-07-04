@@ -1,6 +1,6 @@
 import socket, struct, json, time, sys
 
-MCAST_GRP = '239.1.1.1'   # match LNM addr
+MCAST_GRP = '239.255.0.1'   # match LNM addr
 MCAST_PORT = 3333
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
