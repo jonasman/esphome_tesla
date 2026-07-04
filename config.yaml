@@ -10,9 +10,13 @@ substitutions:
   ct1_value_id: internal_meter_reading # Name of the (number) variable that needs to be set as ct reading
   min_value: 0.0
   max_value: 45.0 # adjust to a value above configured max-value in Wall Connector config
-  start_value: 0.0 # Initial value at boot - determines the behavior when home assistant
-                   # is not dynamically changing the ct amps: set it at zero and the maximum charging amps
-                   # will be available to the car. Set it to max_value and the charger will only offer the car 6A
+  watchdog_failsafe_a: "21.0"
+  watchdog_timeout_ms: "10000"
+  start_value: 0.0 # Initial value at boot in manual mode (Shelly disabled) - determines the behavior
+                   # when home assistant is not dynamically changing the ct amps: set it at zero and
+                   # the maximum charging amps will be available to the car. Set it to max_value and
+                   # the charger will only offer the car 6A. In Shelly/MQTT mode, the boot value is
+                   # overridden by on_boot below to start at the failsafe reading instead.
   # serial <-> modbus bridge config
   baud_rate: 115200
   data_bits: 8
@@ -20,8 +24,6 @@ substitutions:
   stop_bits: 1
   board_chip: "ESP32-S3"
   board_name: "WS RS485-CAN"
-  watchdog_failsafe_a: "21.0"
-  watchdog_timeout_ms: "10000"
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -56,6 +58,15 @@ esphome:
   friendly_name: ${friendly_name}
   min_version: 2025.12.0
   name_add_mac_suffix: false
+  on_boot:
+    then:
+      - lambda: |-
+          // In Shelly/MQTT mode, start at the failsafe reading until the first real MQTT
+          // message arrives, instead of assuming zero other load. Manual mode (Shelly
+          // disabled) is left alone and keeps the plain ${start_value} boot default.
+          if (id(enable_shelly)) {
+            id(${ct1_value_id}).publish_state(${watchdog_failsafe_a});
+          }
 
 wifi:
   networks:
@@ -184,9 +195,16 @@ switch:
     lambda: |-
       return id(enable_shelly);
     turn_on_action:
-      globals.set:
-        id: enable_shelly
-        value: "true"
+      - globals.set:
+          id: enable_shelly
+          value: "true"
+      - lambda: |-
+          // Same safety net as on_boot: if Shelly has never delivered a message
+          // this session, don't leave whatever manual value was set - start at
+          // the failsafe reading until the first real MQTT message arrives.
+          if (id(last_shelly_rx_ms) == 0) {
+            id(${ct1_value_id}).publish_state(${watchdog_failsafe_a});
+          }
     turn_off_action:
       globals.set:
         id: enable_shelly
@@ -234,13 +252,16 @@ number:
           // Single-phase: only CT1 has real values
           id(ct1_current_a) = id(${ct1_value_id}).state + id(reading_offset).state;
           id(ct_total_a) = id(ct1_current_a);
-          
-          // Only calculate power if Shelly/MQTT mode is off (MQTT provides actual measured power)
-          if (!id(enable_shelly)) {
+
+          // Use the MQTT-measured power only while Shelly is enabled AND fresh (i.e. at least
+          // one message received, within the watchdog timeout). Otherwise (Shelly off, never
+          // received yet, or stale) derive power from V*A so it always matches the current value.
+          bool shelly_live = id(enable_shelly) && id(last_shelly_rx_ms) != 0 &&
+                              (millis() - id(last_shelly_rx_ms) <= ${watchdog_timeout_ms});
+          if (!shelly_live) {
             id(ct1_power_w) = id(ct1_voltage_v) * id(ct1_current_a); // assume cos phi = 1
             id(ct_total_w) = id(ct1_power_w);
           }
-          // When Shelly is enabled, power is set directly from act_power in MQTT callback
 
   # Add an offset to the current set externally or read by Shelly. Useful to further reduce charging current.
   - platform: template
