@@ -32,7 +32,7 @@ esp32:
   flash_size: 16MB
 
 logger:
-  level: INFO
+  level: DEBUG
   hardware_uart: USB_CDC
   logs:
     uart: INFO
@@ -45,7 +45,8 @@ logger:
     sensor: INFO
     switch: INFO
     number: INFO
-    udp: INFO
+    udp: DEBUG
+    shelly-rpc: DEBUG
 
 esphome:
   name: ${device_name}
@@ -83,23 +84,41 @@ udp:
     on_receive:
       then:
         - lambda: |-
-            if (!id(enable_shelly)) return;
+            ESP_LOGD("shelly-rpc", "Got %zu byte UDP packet", data.size());
+
+            if (!id(enable_shelly)) {
+              ESP_LOGD("shelly-rpc", "Ignoring packet: Read from Shelly (RPC) switch is off");
+              return;
+            }
 
             // NOTE: the udp component's receive buffer is capped at 508 bytes,
             // so an unrelated large frame may arrive truncated and fail to
             // parse as JSON; our em_reading events are small and unaffected.
             std::string json_str(reinterpret_cast<const char*>(data.data()), data.size());
+            ESP_LOGD("shelly-rpc", "Payload: %s", json_str.c_str());
 
-            json::parse_json(json_str, [](JsonObject root) -> bool {
-              if (!root["params"]["events"].is<JsonArray>()) return false;
+            bool matched = json::parse_json(json_str, [](JsonObject root) -> bool {
+              if (!root["params"]["events"].is<JsonArray>()) {
+                ESP_LOGD("shelly-rpc", "No params.events array in packet, ignoring");
+                return false;
+              }
 
               for (JsonVariant ev : root["params"]["events"].as<JsonArray>()) {
                 const char *event_name = ev["event"] | "";
-                if (strcmp(event_name, "${shelly_event_name}") != 0) continue;
-                if (!ev["data"].is<JsonObject>()) continue;
+                if (strcmp(event_name, "${shelly_event_name}") != 0) {
+                  ESP_LOGD("shelly-rpc", "Ignoring event '%s' (want '${shelly_event_name}')", event_name);
+                  continue;
+                }
+                if (!ev["data"].is<JsonObject>()) {
+                  ESP_LOGD("shelly-rpc", "Event '%s' has no data object", event_name);
+                  continue;
+                }
                 JsonObject em = ev["data"];
 
-                if (!em["current"].is<double>()) return false;
+                if (!em["current"].is<double>()) {
+                  ESP_LOGW("shelly-rpc", "Event '%s' data.current missing/not numeric", event_name);
+                  return false;
+                }
                 float current = em["current"];
 
                 // Set power BEFORE publishing current (avoids race condition,
@@ -123,6 +142,9 @@ udp:
               }
               return false;
             });
+            if (!matched) {
+              ESP_LOGD("shelly-rpc", "Packet did not update the meter reading (parse failed or no matching event)");
+            }
 
 # Watchdog: if no RPC packet for 10s, drop the current to 0 so the
 # Wall Connector backs off rather than charging based on stale data.
@@ -137,7 +159,7 @@ interval:
             float failsafe = ${watchdog_failsafe_a};
             if (id(${ct1_value_id}).state != failsafe) {
               ESP_LOGW("shelly-rpc",
-                       "No RPC packet for %u ms, forcing reading to %.1fA (failsafe)",
+                       "No RPC packet for %" PRIu32 " ms, forcing reading to %.1fA (failsafe)",
                        age, failsafe);
               id(${ct1_value_id}).publish_state(failsafe);
             }

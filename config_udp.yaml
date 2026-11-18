@@ -138,7 +138,7 @@ interval:
             float failsafe = ${watchdog_failsafe_a};
             if (id(${ct1_value_id}).state != failsafe) {
               ESP_LOGW("shelly-lnm",
-                       "No LNM packet for %u ms, forcing reading to %.1fA (failsafe)",
+                       "No LNM packet for %" PRIu32 " ms, forcing reading to %.1fA (failsafe)",
                        age, failsafe);
               id(${ct1_value_id}).publish_state(failsafe);
             }
